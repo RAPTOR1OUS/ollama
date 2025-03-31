@@ -21,6 +21,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -784,21 +785,27 @@ func PullHandler(cmd *cobra.Command, args []string) error {
 	defer cancel()
 
 	errc := make(chan error, 1)
+	var mu sync.Mutex
+	progress := make(map[string][2]int64) // digest -> [completed, total]
 	go func() {
 		p := &api.PullRequest{Name: name}
 		errc <- client.Pull(ctx, p, func(up api.ProgressResponse) error {
 			if up.Digest == "" && up.Status != "" {
-				// A non-empty status update without a digest
-				// indicates a terminal error, so we should stop
-				// and return the error.
+				// A status with no digest is a terminal
+				// status. Give up and return an error.
 				//
 				// First, strip any "error:" prefix so it does
 				// not stutter with Cobra's "Error: " prefix.
-				// Our future client will return proper errors.
-				// This works for now though.
+				//
+				// Our future client will handle the stream
+				// updates and errors properly. This works for
+				// now though.
 				status := strings.TrimPrefix(up.Status, "error: ")
 				return errors.New(status)
 			}
+			mu.Lock()
+			progress[up.Digest] = [2]int64{up.Completed, up.Total}
+			mu.Unlock()
 			return nil
 		})
 	}()
