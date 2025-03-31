@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"maps"
 	"math"
 	"net"
 	"net/http"
@@ -810,13 +811,31 @@ func PullHandler(cmd *cobra.Command, args []string) error {
 		})
 	}()
 
-	t := time.NewTicker(100 * time.Millisecond)
+	progressCopy := make(map[string][2]int64)
+	flushProgress := func() {
+		mu.Lock()
+		maps.Copy(progressCopy, progress)
+		mu.Unlock()
+		var completed, total int64
+		for _, v := range progressCopy {
+			completed += v[0]
+			total += v[1]
+		}
+		if total == 0 {
+			return
+		}
+		fmt.Printf("Pulling %s %d/%d %0.1f%%\n", name, completed, total, 100*float64(completed)/float64(total))
+	}
+
+	t := time.NewTicker(100 * time.Millisecond) // "unstarted"
 	defer t.Stop()
 
 	for {
 		select {
 		case <-t.C:
+			flushProgress()
 		case err := <-errc:
+			flushProgress()
 			return err
 		}
 	}
