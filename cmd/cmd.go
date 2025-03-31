@@ -773,16 +773,46 @@ func CopyHandler(cmd *cobra.Command, args []string) error {
 }
 
 func PullHandler(cmd *cobra.Command, args []string) error {
+	name := args[0] // cobra should be cofigured to always pass 1 arg
+
 	client, err := api.ClientFromEnvironment()
 	if err != nil {
 		return err
 	}
 
-	fn := func(resp api.ProgressResponse) error {
-	}
+	ctx, cancel := context.WithCancel(cmd.Context())
+	defer cancel()
 
-	p := &api.PullRequest{Name: args[0]}
-	return client.Pull(cmd.Context(), p, fn)
+	errc := make(chan error, 1)
+	go func() {
+		p := &api.PullRequest{Name: name}
+		errc <- client.Pull(ctx, p, func(up api.ProgressResponse) error {
+			if up.Digest == "" && up.Status != "" {
+				// A non-empty status update without a digest
+				// indicates a terminal error, so we should stop
+				// and return the error.
+				//
+				// First, strip any "error:" prefix so it does
+				// not stutter with Cobra's "Error: " prefix.
+				// Our future client will return proper errors.
+				// This works for now though.
+				status := strings.TrimPrefix(up.Status, "error: ")
+				return errors.New(status)
+			}
+			return nil
+		})
+	}()
+
+	t := time.NewTicker(100 * time.Millisecond)
+	defer t.Stop()
+
+	for {
+		select {
+		case <-t.C:
+		case err := <-errc:
+			return err
+		}
+	}
 }
 
 type generateContextKey string
