@@ -1,15 +1,14 @@
-//go:build mlx
-
 package mlx
 
 /*
-#cgo CFLAGS: -O3 -I${SRCDIR}/../../../build/_deps/mlx-c-src -I${SRCDIR}
+#cgo CFLAGS: -O3 -I${SRCDIR}/../../mlxrunner/mlx/include -I${SRCDIR}
 #cgo darwin LDFLAGS: -lc++ -framework Metal -framework Foundation -framework Accelerate
 #cgo linux LDFLAGS: -lstdc++ -ldl
 #cgo windows LDFLAGS: -lstdc++
 
 // Use generated wrappers instead of direct MLX headers
 #include "mlx.h"
+#include "mlx_error_handler.h"
 #include <stdlib.h>
 #include <stdint.h>
 #include <string.h>
@@ -32,7 +31,7 @@ static inline void set_default_stream(mlx_stream s) {
     _default_stream = s;
 }
 
-// CPU stream for file loading (Load primitive only runs on CPU)
+// CPU stream for operations that only support CPU evaluation
 static inline mlx_stream cpu_stream() {
     if (_cpu_stream.ctx == NULL) {
         _cpu_stream = mlx_default_cpu_stream_new();
@@ -45,6 +44,7 @@ static inline mlx_stream cpu_stream() {
 // nocallback: function won't call back into Go
 */
 import "C"
+
 import (
 	"fmt"
 	"reflect"
@@ -53,6 +53,8 @@ import (
 	"sync/atomic"
 	"time"
 	"unsafe"
+
+	mlxrunnermlx "github.com/ollama/ollama/x/mlxrunner/mlx"
 )
 
 // Dtype represents MLX data types
@@ -147,7 +149,9 @@ var arrayPool = sync.Pool{
 func newArray(array C.mlx_array) *Array {
 	// In compiled closures, MLX manages memory - skip Go tracking
 	if InClosureCallback() {
-		return &Array{c: array}
+		a := &Array{c: array}
+		trackClosureArray(a)
+		return a
 	}
 
 	// Use pooled Array struct for efficiency
@@ -177,7 +181,7 @@ func collect(v reflect.Value, arrays *[]*Array, seen map[uintptr]bool) {
 	}
 
 	// Handle pointers
-	if v.Kind() == reflect.Ptr {
+	if v.Kind() == reflect.Pointer {
 		if v.IsNil() {
 			return
 		}
@@ -201,7 +205,7 @@ func collect(v reflect.Value, arrays *[]*Array, seen map[uintptr]bool) {
 
 	// Handle structs
 	if v.Kind() == reflect.Struct {
-		for i := 0; i < v.NumField(); i++ {
+		for i := range v.NumField() {
 			field := v.Field(i)
 			if field.CanInterface() {
 				collect(field, arrays, seen)
@@ -212,7 +216,7 @@ func collect(v reflect.Value, arrays *[]*Array, seen map[uintptr]bool) {
 
 	// Handle slices
 	if v.Kind() == reflect.Slice {
-		for i := 0; i < v.Len(); i++ {
+		for i := range v.Len() {
 			collect(v.Index(i), arrays, seen)
 		}
 		return
@@ -243,6 +247,18 @@ func FreeStruct(v any) {
 	}
 }
 
+// ReleaseAll releases all arrays tracked by this package.
+// Use this when tearing down a whole MLX context; normal model code should
+// prefer FreeStruct or explicit Array.Free calls for owned state.
+func ReleaseAll() {
+	for _, a := range arrays {
+		if a != nil {
+			a.kept = false
+		}
+	}
+	cleanup()
+}
+
 // Keep marks arrays to persist across Eval() cleanup.
 // Kept arrays will NOT be freed when Eval() runs cleanup.
 func Keep(arrays ...*Array) {
@@ -271,6 +287,27 @@ func cleanup() int {
 	}
 	arrays = arrays[:n]
 	return freed
+}
+
+func keepDuringRead(readArrays ...*Array) func() {
+	type state struct {
+		array *Array
+		kept  bool
+	}
+
+	states := make([]state, 0, len(readArrays))
+	for _, a := range readArrays {
+		if a != nil {
+			states = append(states, state{array: a, kept: a.kept})
+			a.kept = true
+		}
+	}
+
+	return func() {
+		for _, s := range states {
+			s.array.kept = s.kept
+		}
+	}
 }
 
 // DebugArrays prints summary info about all tracked arrays.
@@ -312,7 +349,7 @@ func DebugArraysVerbose(topN int) {
 	}
 
 	// Sort by size descending
-	for i := 0; i < len(infos)-1; i++ {
+	for i := range len(infos) - 1 {
 		for j := i + 1; j < len(infos); j++ {
 			if infos[j].bytes > infos[i].bytes {
 				infos[i], infos[j] = infos[j], infos[i]
@@ -1010,7 +1047,7 @@ func Slice(a *Array, start, stop []int32) *Array {
 	cStart := make([]C.int, n)
 	cStop := make([]C.int, n)
 	cStrides := make([]C.int, n)
-	for i := 0; i < n; i++ {
+	for i := range n {
 		cStart[i] = C.int(start[i])
 		cStop[i] = C.int(stop[i])
 		cStrides[i] = 1 // Default stride of 1
@@ -1231,7 +1268,7 @@ func (a *Array) Dim(axis int) int32 {
 func (a *Array) Shape() []int32 {
 	ndim := a.Ndim()
 	shape := make([]int32, ndim)
-	for i := 0; i < ndim; i++ {
+	for i := range ndim {
 		shape[i] = a.Dim(i)
 	}
 	return shape
@@ -1275,17 +1312,38 @@ func (d Dtype) ItemSize() int64 {
 // Note: Arrays of other dtypes (bf16, f16, etc) are automatically converted to float32.
 // Note: Triggers cleanup of non-kept arrays.
 func (a *Array) Data() []float32 {
-	cleanup()
+	if a == nil || !a.Valid() {
+		return nil
+	}
+	restore := keepDuringRead(a)
+	defer func() {
+		restore()
+		cleanup()
+	}()
+
 	size := a.Size()
 	if size == 0 {
 		return nil
 	}
 
 	arr := a
+	var restoreCast func()
 	if a.Dtype() != DtypeFloat32 {
 		arr = AsType(a, DtypeFloat32)
+		restoreCast = keepDuringRead(arr)
 		arr.Eval()
-		// Cast array will be cleaned up on next Eval
+		defer func() {
+			restoreCast()
+		}()
+	}
+	var restoreContiguous func()
+	if !arr.IsContiguous() {
+		arr = Contiguous(arr)
+		restoreContiguous = keepDuringRead(arr)
+		arr.Eval()
+		defer func() {
+			restoreContiguous()
+		}()
 	}
 
 	ptr := C.mlx_array_data_float32(arr.c)
@@ -1311,7 +1369,15 @@ func (a *Array) Item() float32 {
 // Note: For non-contiguous arrays (e.g., from SliceStride), call Contiguous() first.
 // Note: Triggers cleanup of non-kept arrays.
 func (a *Array) DataInt32() []int32 {
-	cleanup()
+	if a == nil || !a.Valid() {
+		return nil
+	}
+	restore := keepDuringRead(a)
+	defer func() {
+		restore()
+		cleanup()
+	}()
+
 	size := a.Size()
 	if size == 0 {
 		return nil
@@ -1328,7 +1394,15 @@ func (a *Array) DataInt32() []int32 {
 // ItemInt32 gets a single scalar value efficiently (no array copy).
 // Note: Triggers cleanup of non-kept arrays.
 func (a *Array) ItemInt32() int32 {
-	cleanup()
+	if a == nil || !a.Valid() {
+		return 0
+	}
+	restore := keepDuringRead(a)
+	defer func() {
+		restore()
+		cleanup()
+	}()
+
 	var val C.int32_t
 	C.mlx_array_item_int32(&val, a.c)
 	return int32(val)
@@ -1339,7 +1413,15 @@ func (a *Array) ItemInt32() int32 {
 // For non-contiguous arrays, call Contiguous() first.
 // Note: Triggers cleanup of non-kept arrays.
 func (a *Array) Bytes() []byte {
-	cleanup()
+	if a == nil || !a.Valid() {
+		return nil
+	}
+	restore := keepDuringRead(a)
+	defer func() {
+		restore()
+		cleanup()
+	}()
+
 	nbytes := a.Nbytes()
 	if nbytes == 0 {
 		return nil
@@ -1359,7 +1441,9 @@ func (a *Array) Bytes() []byte {
 	default:
 		// For other types (bf16, f16, etc), convert to float32
 		arr := AsType(a, DtypeFloat32)
+		restoreCast := keepDuringRead(arr)
 		arr.Eval()
+		defer restoreCast()
 		ptr = unsafe.Pointer(C.mlx_array_data_float32(arr.c))
 		nbytes = arr.Nbytes()
 	}
@@ -1502,15 +1586,21 @@ type SafetensorsFile struct {
 	metadata C.mlx_map_string_to_string
 }
 
-// LoadSafetensorsNative loads a safetensors file using MLX's optimized loader
-// Note: Uses CPU stream because Load primitive only runs on CPU
+// LoadSafetensorsNative loads a safetensors file using MLX's optimized loader.
+// On CUDA, Load::eval_gpu is implemented so we use the default (GPU) stream.
+// On Metal, Load::eval_gpu is not implemented so we must use the CPU stream.
 func LoadSafetensorsNative(path string) (*SafetensorsFile, error) {
 	cPath := C.CString(path)
 	defer C.free(unsafe.Pointer(cPath))
 
+	stream := C.default_stream()
+	if runtime.GOOS == "darwin" {
+		stream = C.cpu_stream()
+	}
+
 	var arrays C.mlx_map_string_to_array
 	var metadata C.mlx_map_string_to_string
-	if C.mlx_load_safetensors(&arrays, &metadata, cPath, C.cpu_stream()) != 0 {
+	if C.mlx_load_safetensors(&arrays, &metadata, cPath, stream) != 0 {
 		return nil, fmt.Errorf("failed to load safetensors: %s", path)
 	}
 	return &SafetensorsFile{arrays: arrays, metadata: metadata}, nil
@@ -1651,7 +1741,7 @@ func SliceUpdate(a, update *Array, start, stop []int32) *Array {
 	cStart := make([]C.int, n)
 	cStop := make([]C.int, n)
 	cStrides := make([]C.int, n)
-	for i := 0; i < n; i++ {
+	for i := range n {
 		cStart[i] = C.int(start[i])
 		cStop[i] = C.int(stop[i])
 		cStrides[i] = 1 // Default stride of 1
@@ -1689,11 +1779,15 @@ func ArgmaxKeepArray(logits *Array) *Array {
 //
 // Thread safety: Protected by randomStateMu, mimicking Python's GIL behavior.
 // All random functions that use global state acquire this lock.
-var RandomState = []*Array{nil}
-var randomStateMu sync.Mutex
+var (
+	RandomState   = []*Array{nil}
+	randomStateMu sync.Mutex
+)
 
-var mlxInitialized bool
-var mlxInitError error
+var (
+	mlxInitialized bool
+	mlxInitError   error
+)
 
 // InitMLX initializes the MLX library by dynamically loading libmlxc.
 // This must be called before using any MLX functions.
@@ -1703,9 +1797,15 @@ func InitMLX() error {
 		return mlxInitError
 	}
 
-	// Try to load the MLX dynamic library
-	ret := C.mlx_dynamic_init()
-	if ret != 0 {
+	libPath, err := mlxrunnermlx.LoadedLibraryPath()
+	if err != nil {
+		mlxInitError = fmt.Errorf("failed to initialize MLX: %w", err)
+		return mlxInitError
+	}
+
+	cPath := C.CString(libPath)
+	defer C.free(unsafe.Pointer(cPath))
+	if C.mlx_dynamic_init_path(cPath) != 0 {
 		errMsg := C.GoString(C.mlx_dynamic_error())
 		mlxInitError = fmt.Errorf("failed to initialize MLX: %s", errMsg)
 		return mlxInitError
@@ -1713,14 +1813,33 @@ func InitMLX() error {
 
 	// Initialize all function pointers via dlsym
 	handle := C.mlx_get_handle()
-	ret = C.mlx_load_functions(handle)
-	if ret != 0 {
+	if C.mlx_load_functions(handle) != 0 {
 		mlxInitError = fmt.Errorf("failed to load MLX function symbols")
 		return mlxInitError
 	}
 
 	mlxInitialized = true
 	mlxInitError = nil
+
+	// Enter safe mode: replace the default exit(-1) error handler with one
+	// that logs and stores errors. This prevents a GPU init failure from
+	// killing the entire process during startup.
+	C.mlx_set_safe_init_mode()
+
+	// Lock main goroutine to OS thread for CUDA context stability.
+	// CUDA contexts are bound to threads; Go can migrate goroutines between threads.
+	runtime.LockOSThread()
+	RandomState[0] = RandomKey(uint64(time.Now().UnixMilli()))
+	Keep(RandomState[0]) // Global state should persist
+
+	// Check if the RandomKey call silently failed under safe mode
+	if C.mlx_had_init_error() != 0 {
+		msg := C.GoString(C.mlx_get_init_error())
+		mlxInitError = fmt.Errorf("MLX GPU init failed: %s", msg)
+		mlxInitialized = false
+		return mlxInitError
+	}
+
 	return nil
 }
 
@@ -1734,20 +1853,11 @@ func GetMLXInitError() error {
 	return mlxInitError
 }
 
-func init() {
-	// Initialize MLX dynamic library first
-	if err := InitMLX(); err != nil {
-		// Don't panic in init - let the caller handle the error
-		// Store the error for later retrieval
-		mlxInitError = err
-		return
-	}
-
-	// Lock main goroutine to OS thread for CUDA context stability.
-	// CUDA contexts are bound to threads; Go can migrate goroutines between threads.
-	runtime.LockOSThread()
-	RandomState[0] = RandomKey(uint64(time.Now().UnixMilli()))
-	Keep(RandomState[0]) // Global state should persist
+// RestoreDefaultErrorHandler restores the default MLX error handler (exit on error).
+// Call this from runner entry points after confirming MLX is available,
+// to get the original strict error behavior during actual MLX work.
+func RestoreDefaultErrorHandler() {
+	C.mlx_set_default_error_mode()
 }
 
 // RandomKey creates a PRNG key from a seed
@@ -2011,7 +2121,8 @@ func Quantize(w *Array, groupSize, bits int, mode string) (weights, scales, bias
 	optGroupSize := C.mlx_optional_int{value: C.int(groupSize), has_value: true}
 	optBits := C.mlx_optional_int{value: C.int(bits), has_value: true}
 	res := C.mlx_vector_array_new()
-	C.mlx_quantize(&res, w.c, optGroupSize, optBits, cMode, C.default_stream())
+	var globalScale C.mlx_array
+	C.mlx_quantize(&res, w.c, optGroupSize, optBits, cMode, globalScale, C.default_stream())
 
 	// Result is a vector of arrays: [weights, scales, biases?]
 	// mxfp8 mode returns only 2 elements (no biases)
@@ -2047,7 +2158,8 @@ func Dequantize(w, scales, biases *Array, groupSize, bits int, mode string) *Arr
 	}
 
 	res := C.mlx_array_new()
-	C.mlx_dequantize(&res, w.c, scales.c, b, optGroupSize, optBits, cMode, optDtype, C.default_stream())
+	var globalScale C.mlx_array
+	C.mlx_dequantize(&res, w.c, scales.c, b, optGroupSize, optBits, cMode, globalScale, optDtype, C.default_stream())
 	return newArray(res)
 }
 
@@ -2175,7 +2287,7 @@ func Pad(a *Array, paddings []int32) *Array {
 	// Convert to low/high pairs
 	lowPad := make([]C.int, numAxes)
 	highPad := make([]C.int, numAxes)
-	for i := 0; i < numAxes; i++ {
+	for i := range numAxes {
 		lowPad[i] = C.int(paddings[i*2])
 		highPad[i] = C.int(paddings[i*2+1])
 	}
@@ -2183,7 +2295,7 @@ func Pad(a *Array, paddings []int32) *Array {
 	res := C.mlx_array_new()
 	// mlx_pad takes axes, low, high arrays
 	axes := make([]C.int, numAxes)
-	for i := 0; i < numAxes; i++ {
+	for i := range numAxes {
 		axes[i] = C.int(i)
 	}
 	cMode := C.CString("constant")
