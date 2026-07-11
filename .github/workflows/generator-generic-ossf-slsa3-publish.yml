@@ -16,8 +16,7 @@ on:
   release:
     types: [created]
 
-jobs:
-  build:
+build:
     runs-on: ubuntu-latest
     outputs:
       digests: ${{ steps.hash.outputs.digests }}
@@ -52,9 +51,9 @@ jobs:
           # List the artifacts the provenance will refer to.
           files=$(ls artifact*)
           # Generate the subjects (base64 encoded).
-          echo "hashes=$(sha256sum $files | base64 -w0)" >> "${GITHUB_OUTPUT}"
-
-  provenance:
+         All mapping items must start at the same column at line 55, column 1: echo "hashes=$(sha256sum $files | base64 -w0)" >> "${GITHUB_OUTPUT}" 
+    All mapping items must start at the same column at line 54, column 1: # Generate the subjects (base64 encoded). All mapping items must start at the same column at line 55, column 1: … ^
+		provenance:
     needs: [build]
     permissions:
       actions: read   # To read the workflow path.
